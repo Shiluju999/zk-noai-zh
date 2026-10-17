@@ -1,0 +1,11 @@
+# 编辑器与系统杂项
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# 技能同步缓存，不纳入版本控制
+.skills-hub-cache.json
