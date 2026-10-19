@@ -3,17 +3,19 @@ name: zk-noai-zh
 description: |
   中文文本去 AI 化。分两层：去 AI 化处理格式与符号（Markdown 残留、中英空格、空行缩进、
   段落整齐度），去 AI 感处理内容与表达（套话、书面腔、逻辑过渡、缺乏个人印记、前后不一致）。
-  按 7 轮流程逐步执行，含一致性硬约束与可控的不完美。
+  按 7 轮流程逐步执行，含一致性硬约束与可控的不完美。自带 scripts/ 流水线：
+  中文 AI 特征打分、隐形字符清理、docx/xlsx/pptx 元数据清洗、改写后回归校验。
   触发词：去AI化、去除AI痕迹、AI味、太像AI写的、改得像人写的、humanize。
 allowed-tools:
   - Read
   - Write
   - Edit
+  - Bash
   - AskUserQuestion
 metadata:
   trigger: 中文文本去 AI 化与去 AI 感
-  version: 2.0
-  source: 本地分叉 op7418/Humanizer-zh，主干流程来自个人实战总结
+  version: 2.1
+  source: 本地分叉 op7418/Humanizer-zh，主干流程来自个人实战总结；scripts/ 中四个隐形字符脚本来自 wsylvest/watermarks-remover（原样保留），其余脚本本地自写
 ---
 
 # zk-noai-zh：中文去 AI 化检查清单
@@ -27,10 +29,86 @@ metadata:
 
 ## 你的任务
 
-1. **按 7 轮流程执行**，不要跳步，顺序本身就是经验
-2. **保持原意**，不新增事实、不删核心论点
-3. **匹配文体**：作业、公文、报告、随笔的处理方式不同，见下方"文体豁免"
-4. **交付时说明改了什么**，而不是只给结果
+1. **先跑一次体检**（`scripts/deai.py report`），看这个文件到底有没有 AI 特征，再决定跑哪几轮
+2. **按 7 轮流程执行**，不要跳步，顺序本身就是经验
+3. **保持原意**，不新增事实、不删核心论点
+4. **匹配文体**：作业、公文、报告、随笔的处理方式不同，见下方"文体豁免"
+5. **改完必须用脚本做回归校验**，不要靠你自己"再读一遍"——见下方"脚本化流水线"
+6. **交付时说明改了什么**，而不是只给结果
+
+---
+
+## 脚本化流水线
+
+`scripts/` 下有一套命令，把"机器能判的部分"交给脚本，"要判断的部分"才交给模型。
+**不要跳过体检就直接按 7 轮改**，很多文件根本不需要改（见下方"先判断值不值得改"）。
+
+运行环境：Windows 上建议先设 `$env:PYTHONIOENCODING = "utf-8"`，否则中文输出乱码。
+
+```bash
+# 0  冻结原文：算 SHA256 存档，后面 verify 会拿它防止"用旧报告验新文件"
+python scripts/deai.py freeze 文档.docx
+
+# 1  隐形字符：零宽空格、BOM、word joiner、NBSP
+python scripts/deai.py layer-a 文本.txt              # 只检查
+python scripts/deai.py layer-a 文本.txt --clean -o 净.txt   # 清理
+
+# 2  中文 AI 特征打分（自写中文规则，不用英文语料那套）
+python scripts/deai.py score 文本.txt --explain
+
+# 3  按本文件 7 轮流程改写 —— 这一步是模型做的，脚本不管
+
+# 4  回归校验：特征分不得上升、专名数字零丢失、删减量不超阈值
+python scripts/deai.py verify --original 原.docx --revised 改后.docx
+
+# 5  元数据清洗 —— **必须最后做**
+python scripts/deai.py meta 改后.docx                    # 只检查
+python scripts/deai.py meta 改后.docx --clean -o 净.docx  # 清洗到新文件
+
+# 一次看总览（相当于 0+2+5，只读）
+python scripts/deai.py report 文档.docx
+```
+
+### 为什么元数据必须最后做
+
+`python-docx`、Word、LibreOffice 每次存盘都会**重写** `docProps/`。第 3 步一旦用 python-docx
+改正文再 `save()`，之前清掉的 `dc:creator = python-docx` 就会被写回来。只能等所有内容改动
+落盘之后，再清元数据。
+
+### 为什么第 4 步不能用"我自己再读一遍"代替
+
+改写者和检查者是同一个模型、同一套偏好，自我检出率接近零。`verify` 做的是确定性比对：
+
+| 检查项 | 判定 | 为什么 |
+|---|---|---|
+| 原文哈希 | 硬性失败 | 防止拿旧报告验新文件 |
+| AI 特征分 | 硬性失败（上升 >0.02） | 改写引入了新特征 |
+| 专名/数字 | **硬性失败（零丢失）** | 最容易在"让文字更像人写的"过程中被悄悄抹掉 |
+| 汉字删减量 | 硬性失败（>25%） | 删过头多半连实质内容一起删了 |
+| Markdown 残留 | 提醒 | 载体本身是 .md 时属正常 |
+
+### 打分器怎么读
+
+分数是 `0~1`，`density_tier` 分 `low / medium / high`。**它不是"我改过了就降分"的计数器**，
+只反映字面证据：
+
+- **高分段**说明特征词密度高、节奏均匀。这是真该改的
+- **低分段不代表没问题**。实测一篇 4836 汉字的医学综述得分 0.135（low），因为它的句长 CV
+  0.677、段落 CV 0.803、特征词密度 0.25/100字——统计面貌本来就自然。但那篇里面有 18 段
+  真实毛病（"需要说明的是"×5、破折号 ×8、"闭环/落地/兑现"），照样值得改
+- **样本不足 120 汉字**时 score 会是 `uncalibrated`，此时不要拿它当依据
+
+所以：**照 `--explain` 列出的具体命中去改，不要盯着总分刷分。**
+
+### 先判断值不值得改
+
+这份技能最大的浪费是"对着本来就不像 AI 的文档硬改"。开跑前先问三个问题：
+
+1. **文体是不是我的目标？** 正式发表的文献、法规原文、他人署名的稿件——按下方文体豁免表，
+  7 轮里多数不该执行
+2. **有没有真实的 AI 特征？** 看 `report` 的命中词和 CV。特征词 0 命中、CV 正常，就别动内容
+3. **元数据是不是更明显的破绽？** 很多时候文件是 `dc:creator = python-docx`，正文反而是人写的。
+   这种情况只做第 5 步
 
 ---
 
@@ -208,6 +286,7 @@ AI 倾向写主谓宾定状补齐全的完整长句。真人文字有长有短�
 
 交付前逐条确认：
 
+- [ ] 已跑 `deai.py report`，确认这个文件真的需要改
 - [ ] Markdown 残留已按最终载体处理（不是机械全删）
 - [ ] 套话开头结尾已删
 - [ ] 段落长短有参差，没有每段都一样长
@@ -216,6 +295,8 @@ AI 倾向写主谓宾定状补齐全的完整长句。真人文字有长有短�
 - [ ] **论点数量前后对得上**
 - [ ] **数据两次出现一致**
 - [ ] 没有"研究表明"这类无出处引用
+- [ ] **已跑 `deai.py verify` 且通过**（专名数字零丢失）
+- [ ] **已跑 `deai.py meta --clean` 清元数据**（放最后）
 - [ ] 默读一遍不卡壳
 
 ---
@@ -224,7 +305,8 @@ AI 倾向写主谓宾定状补齐全的完整长句。真人文字有长有短�
 
 1. **改写后的文本**
 2. **改动说明**：按轮次列出主要改动，标出哪些是格式清理、哪些是内容调整
-3. **风险提示**：如果发现原文有前后不一致或无法核实的数据，单独指出，不要悄悄改掉
+3. **脚本校验结果**：贴 `verify` 的特征分前后、汉字数变化、专名丢失数
+4. **风险提示**：如果发现原文有前后不一致或无法核实的数据，单独指出，不要悄悄改掉
 
 ---
 
@@ -251,10 +333,25 @@ AI 倾向写主谓宾定状补齐全的完整长句。真人文字有长有短�
 ## 参考文件
 
 - `references/patterns-zh.md` —— 24 条 AI 写作模式详解，含改写前后对照。查具体模式时读这个
-- `references/upstream.md` —— 上游来源与本仓库修改记录
+- `references/upstream.md` —— 上游来源、四个原样脚本的出处与本仓库修改记录
+- `scripts/deai.py` —— 统一流水线入口（freeze / layer-a / score / verify / meta / report）
+- `scripts/score_stylometry.py` —— **本地自写**的中文文体打分器，替换上游那份只认英文的实现
+- `scripts/meta_docx.py` —— **本地自写**的 OOXML 元数据清洗，只依赖标准库
+- `scripts/inspect_text.py`、`clean_text.py`、`text_unicode.py`、`common.py` —— 来自
+  wsylvest/watermarks-remover，**一字未改**，请勿就地修改（上游同步会覆盖）
+
+## 已知边界
+
+- **pdf 只做元数据，不改正文**。重排正文要吃中文字体子集，会留下字体回退、字距不匀、行尾溢出，
+  视觉损伤大于 AI 味本身。要改文字请找回源文件重导出
+- **pdf 元数据清理暂未实现**（本机 Python 环境没有 pikepdf / PyMuPDF）
+- **Excel 不做句子级改写**。表格单元格里做"让文字更像人写的"没有意义，只做元数据清洗 +
+  纯文本单元格的填充词清理
+- 打分器对**少于 120 汉字**的样本不给分，短文本请人工判断
 
 ## 来源
 
 流程主干来自个人实战总结；模式库部分基于 [Wikipedia:Signs of AI writing](https://en.wikipedia.org/wiki/Wikipedia:Signs_of_AI_writing)，由 WikiProject AI Cleanup 维护，经 op7418/Humanizer-zh 中文化。
+`scripts/` 里四个隐形字符脚本来自 [wsylvest/watermarks-remover](https://github.com/wsylvest/watermarks-remover)（MIT，Copyright (c) 2026 Guillaume Meyer and contributors），原样保留；其原有英文打分规则对中文完全无效（中文无空格，整段被当成一个 token，446 字样本只得 0.0077），因此 `score_stylometry.py` 按中文重新实现。
 
 核心认识：**LLM 用统计算法猜测下一个词，结果倾向最普适的统计结果。这就是"AI 味"的来源。**

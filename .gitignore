@@ -9,3 +9,11 @@ Thumbs.db
 
 # 技能同步缓存，不纳入版本控制
 .skills-hub-cache.json
+
+# Python 字节码缓存
+__pycache__/
+*.pyc
+
+# 脚本运行产物：冻结存档与元数据清洗的备份
+*.freeze.json
+*.bak
